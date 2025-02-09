@@ -14,10 +14,17 @@ LR_ACTOR = 3e-4
 LR_CRITIC = 1e-3
 
 class PPOTF:
-    def __init__(self):
+    def __init__(self, verbose: int = 0):
+        # Initialization of personal variables
+        self.verbose = verbose
+        
+        # Initialization of algorithm variables
         self.T = 2048
         self.gamma = 0.99
         self.lambda_gae = 0.95
         self.epsilon_clip = 0.2
-        self.
+        
+    def train(self, episodes: int = 1000):
+        for episode in range(episodes):
+            
  
