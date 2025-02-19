@@ -8,7 +8,7 @@ class CustomRewardWrapper(gym.Wrapper):
         super(CustomRewardWrapper, self).__init__(env)
         
     def step(self, action):
-        state, reward, done, info = self.env.step(action)
+        state, reward, done, info, _ = self.env.step(action)
         
         reward = 0 # Initialize the reward to zero to adjust it
         
