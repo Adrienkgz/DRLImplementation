@@ -4,6 +4,7 @@ import gymnasium as gym
 from dataclasses import dataclass
 from torch.distributions.categorical import Categorical
 import numpy as np
+import time
 
 @dataclass
 class Args:
@@ -22,19 +23,29 @@ class MetricsContainer:
     actor_losses = []
     critic_losses = []
     entropy_losses = []
+    entropy_mean = []
     
+    def __post_init__(self):
+        self.start_time = time.time()
+        self.last_iteration_time = self.start_time
+        
     def reset(self):
         self.episode_rewards = []
         self.actor_losses = []
         self.critic_losses = []
         self.entropy_losses = []
+        self.entropy_mean = []
+        self.last_iteration_time = time.time()
         
     def show(self):
-        print(f'len_mean : {len(self.episode_rewards)/self.num_steps}')
+        print(f'time_elapsed : {time.time() - self.start_time}')
+        print(f'step/seconds : {self.num_steps/(time.time() - self.last_iteration_time)}')
+        print(f'len_mean : {self.num_steps/len(self.episode_rewards)}')
         print(f'mean_reward : {np.mean(self.episode_rewards)}')
         print(f'mean_actor_loss : {np.mean(self.actor_losses)}')
         print(f'mean_critic_loss : {np.mean(self.critic_losses)}')
-        print(f'\n\n')
+        print(f'mean_entropy : {np.mean(self.entropy_mean)}')
+        print(f'\n')
         self.reset()
 
 @dataclass
@@ -123,14 +134,15 @@ class PPOTorch(nn.Module):
     
     def train(self, total_timesteps):
         while self.actual_step < total_timesteps:
-            state, _ = env.reset()
+            state, _ = env.reset(seed=12)
             state = torch.tensor(state, dtype=torch.float32)
             episode_reward = 0
             done = False
-            
+            entropies = []
             while not done:
                 with torch.no_grad():
-                    action, logprobs, _, _ = self.get_action_and_value(state)
+                    action, logprobs, entropy, _ = self.get_action_and_value(state)
+                entropies.append(entropy)
                 next_state, reward, done, _, _ = env.step(action.numpy())
                 next_state, reward = torch.tensor(next_state, dtype=torch.float32), torch.tensor(reward, dtype=torch.float32)
                 episode_reward += reward
@@ -144,6 +156,7 @@ class PPOTorch(nn.Module):
                 state = next_state
                 self.actual_step += 1
             self.metrics.episode_rewards.append(episode_reward)
+            self.metrics.entropy_mean.append(torch.stack(entropies).mean().item())
                 
     def update(self):
         self.buffer.compute_advantages_and_returns()
@@ -187,7 +200,7 @@ class PPOTorch(nn.Module):
             
     def update_critic(self):
         def compute_loss_critic(states, returns):
-            return nn.MSELoss()(self.critic(states), returns)
+            return 0.5 * ((self.critic(states) - returns) ** 2).mean()
         
         states = self.buffer.states
         returns = self.buffer.returns
