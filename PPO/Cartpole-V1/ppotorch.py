@@ -14,7 +14,11 @@ class Args:
     num_steps: int = 2048
     batch_size: int = 64
     epochs: int = 10
-    lr: float = 2.5e-4
+    lr_actor: float = 1e-2
+    lr_critic: float = 1e-2
+    ent_coeff: float = 0
+    norm_adv: bool = False
+    max_grad_norm: float = 0.5
     
 @dataclass
 class MetricsContainer:
@@ -24,6 +28,7 @@ class MetricsContainer:
     critic_losses:list[float] = field(default_factory=list)
     entropy_losses:list[float] = field(default_factory=list)
     entropy_mean:list[float] = field(default_factory=list)
+    advantages:None = None
     
     def __post_init__(self):
         self.start_time = time.time()
@@ -48,6 +53,8 @@ class MetricsContainer:
         print(f'mean_actor_loss : {np.mean(self.actor_losses)}')
         print(f'mean_critic_loss : {np.mean(self.critic_losses)}')
         print(f'mean_entropy : {np.mean(self.entropy_mean)}')
+        print(f"Variance of Advantage: {torch.var(self.advantages).item()}")
+
         print(f'\n')
         self.reset()
 
@@ -59,13 +66,13 @@ class ExperienceBuffer:
         env = ppo.env
         self.cursor = 0
         self.states = torch.zeros(self.num_steps, env.observation_space.shape[0])
-        self.actions = torch.zeros(self.num_steps, 1)
-        self.rewards = torch.zeros(self.num_steps, 1)
+        self.actions = torch.zeros(self.num_steps,)
+        self.rewards = torch.zeros(self.num_steps,)
         self.next_states = torch.zeros(self.num_steps, env.observation_space.shape[0])
-        self.logprobs = torch.zeros(self.num_steps, 1)
-        self.dones = torch.zeros(self.num_steps, 1)
-        self.advantages = torch.zeros(self.num_steps, 1)
-        self.returns = torch.zeros(self.num_steps, 1)
+        self.logprobs = torch.zeros(self.num_steps,)
+        self.dones = torch.zeros(self.num_steps,)
+        self.advantages = torch.zeros(self.num_steps,)
+        self.returns = torch.zeros(self.num_steps,)
     
     def append(self, state, action, reward, next_state, logprobs, done):
         self.states[self.cursor] = state
@@ -79,10 +86,10 @@ class ExperienceBuffer:
     def compute_advantages_and_returns(self):
         with torch.no_grad():
             values = self.ppo.get_value(self.states)
-            next_value = self.ppo.get_value(self.next_states[-1]).reshape(1, -1)  # Dernière valeur de l’épisode
+            next_value = self.ppo.get_value(self.next_states[-1]).reshape(1, -1)
 
-            advantages = torch.zeros_like(self.rewards).to(self.states.device)  # Initialisation propre
-            lastgaelam = 0  # Stocke l’avantage précédent pour propagation récursive
+            advantages = torch.zeros_like(self.rewards)
+            lastgaelam = 0  
 
             for t in reversed(range(self.num_steps)):
                 if t == self.num_steps - 1:
@@ -98,6 +105,7 @@ class ExperienceBuffer:
 
             self.returns = advantages + values  # Ajout des valeurs pour obtenir les retours
             self.advantages = advantages
+            self.ppo.metrics.advantages = advantages
             
     def reset(self):
         self.cursor = 0
@@ -121,8 +129,8 @@ class PPOTorch(nn.Module):
         # Initialization of actor and critic networks and their optimizers
         self.actor = self.create_network('actor')
         self.critic = self.create_network('critic')
-        self.optimizer_actor = torch.optim.Adam(self.actor.parameters(), lr=args.lr)
-        self.optimizer_critic = torch.optim.Adam(self.critic.parameters(), lr=args.lr)
+        self.optimizer_actor = torch.optim.Adam(self.actor.parameters(), lr=args.lr_actor)
+        self.optimizer_critic = torch.optim.Adam(self.critic.parameters(), lr=args.lr_critic)
         
         # Variable used in the algorithm
         self.buffer = ExperienceBuffer(self)
@@ -183,11 +191,13 @@ class PPOTorch(nn.Module):
         self.buffer.reset()
             
     def update_actor_policy(self):
-        def compute_clip_loss(old_policies, new_policies, advantages):
-            logratios = new_policies - old_policies
+        def compute_clip_loss(batch_old_policies, batch_new_policies, batch_advantages):
+            if self.args.norm_adv:
+                batch_advantages = batch_advantages / (torch.abs(batch_advantages).mean() + 1e-8)
+            logratios = batch_new_policies - batch_old_policies
             ratios = torch.exp(logratios)
             clipped_ratios = torch.clamp(ratios, 1 - self.args.epsilon_clip, 1 + self.args.epsilon_clip)
-            loss = -torch.min(ratios * advantages, clipped_ratios * advantages)
+            loss = -torch.min(ratios * batch_advantages, clipped_ratios * batch_advantages)
             return loss.mean()
         
         old_policies = self.buffer.logprobs
@@ -204,19 +214,28 @@ class PPOTorch(nn.Module):
             batch_old_policies = old_policies[local_indices]
             batch_advantages = advantages[local_indices]
             
-            _, batch_new_policies, _, _ = self.get_action_and_value(batch_states, batch_actions)
-        
-            loss = compute_clip_loss(batch_old_policies, batch_new_policies, batch_advantages)
+            _, batch_new_policies, entropy, _ = self.get_action_and_value(batch_states, batch_actions)
+
+            policy_loss = compute_clip_loss(batch_old_policies, batch_new_policies, batch_advantages)
+            
+            entropy_loss = -self.args.ent_coeff * torch.mean(entropy)
+            loss = policy_loss + entropy_loss
             
             # Metrics
             self.metrics.actor_losses.append(loss.item())
             
             self.optimizer_actor.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), args.max_grad_norm)
             self.optimizer_actor.step()
             
     def update_critic(self):
         def compute_loss_critic(states, returns):
+            x= self.critic(states)
+            y = returns
+            z = (self.critic(states) - returns)
+            z2 = (self.critic(states) - returns) ** 2
+            z3 = 0.5 * ((self.critic(states) - returns) ** 2).mean()
             return 0.5 * ((self.critic(states) - returns) ** 2).mean()
         
         states = self.buffer.states
@@ -236,6 +255,7 @@ class PPOTorch(nn.Module):
             
             self.optimizer_critic.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(self.critic.parameters(), args.max_grad_norm)
             self.optimizer_critic.step()
     
 if __name__ == '__main__':
