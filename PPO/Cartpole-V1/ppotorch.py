@@ -76,16 +76,25 @@ class ExperienceBuffer:
     def compute_advantages_and_returns(self):
         with torch.no_grad():
             values = self.ppo.get_value(self.states)
-            next_values = self.ppo.get_value(self.next_states)
-            
-            td_errors = self.rewards + self.ppo.args.gamma * next_values * (1 - self.dones) - values
-            
-            self.advantages[-1] = td_errors[-1]
-            
-            for t in reversed(range(self.num_steps-1)):
-                self.advantages[t] = td_errors[t] + self.ppo.args.gamma * self.ppo.args.lambda_gae * (1 - self.dones[t]) * self.advantages[t+1]
+            next_value = self.ppo.get_value(self.next_states[-1]).reshape(1, -1)  # Dernière valeur de l’épisode
 
-            self.returns = self.advantages + self.ppo.get_value(self.states)
+            advantages = torch.zeros_like(self.rewards).to(self.states.device)  # Initialisation propre
+            lastgaelam = 0  # Stocke l’avantage précédent pour propagation récursive
+
+            for t in reversed(range(self.num_steps)):
+                if t == self.num_steps - 1:
+                    nextnonterminal = 1.0 - self.dones[-1]  # Vérifie si l’épisode est réellement terminé
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - self.dones[t + 1]  # 0 si épisode terminé, 1 sinon
+                    nextvalues = values[t + 1]  # Utilisation des valeurs futures
+
+                delta = self.rewards[t] + self.ppo.args.gamma * nextvalues * nextnonterminal - values[t]
+                lastgaelam = delta + self.ppo.args.gamma * self.ppo.args.lambda_gae * nextnonterminal * lastgaelam
+                advantages[t] = lastgaelam
+
+            self.returns = advantages + values  # Ajout des valeurs pour obtenir les retours
+            self.advantages = advantages
             
     def reset(self):
         self.cursor = 0
