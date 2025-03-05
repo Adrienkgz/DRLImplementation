@@ -12,9 +12,9 @@ class Args:
     lambda_gae: float = 0.95
     epsilon_clip: float = 0.2
     num_steps: int = 2048
-    batch_size: int = 32
+    batch_size: int = 64
     epochs: int = 10
-    lr: float = 1e-3
+    lr: float = 2.5e-4
     
 @dataclass
 class MetricsContainer:
@@ -28,6 +28,7 @@ class MetricsContainer:
     def __post_init__(self):
         self.start_time = time.time()
         self.last_iteration_time = self.start_time
+        self.num_updates = 1
         
     def reset(self):
         self.episode_rewards = []
@@ -36,8 +37,10 @@ class MetricsContainer:
         self.entropy_losses = []
         self.entropy_mean = []
         self.last_iteration_time = time.time()
+        self.num_updates += 1
         
     def show(self):
+        print(f'num_steps_global : {self.num_updates*self.num_steps}')
         print(f'time_elapsed : {time.time() - self.start_time}')
         print(f'step/seconds : {self.num_steps/(time.time() - self.last_iteration_time)}')
         print(f'len_mean : {self.num_steps/len(self.episode_rewards)}')
@@ -99,6 +102,11 @@ class ExperienceBuffer:
     def reset(self):
         self.cursor = 0
         
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
 class PPOTorch(nn.Module):
     def __init__(self, env, args):
         super(PPOTorch, self).__init__()
@@ -123,11 +131,11 @@ class PPOTorch(nn.Module):
         
     def create_network(self, net_type):
         return nn.Sequential(
-            nn.Linear(self.env.observation_space.shape[0], 64),
+            layer_init(nn.Linear(self.env.observation_space.shape[0], 64)),
             nn.Tanh(),
-            nn.Linear(64, 64),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            nn.Linear(64, self.env.action_space.n if net_type == 'actor' else 1),
+            layer_init(nn.Linear(64, self.env.action_space.n if net_type == 'actor' else 1), std=0.01 if net_type == 'actor' else 1),
         )
         
     def get_action_and_value(self, x, action=None):
@@ -233,5 +241,10 @@ class PPOTorch(nn.Module):
 if __name__ == '__main__':
     args = Args()
     env = gym.make('CartPole-v1')
-    ppo = PPOTorch(env, args)
-    ppo.train(100000)
+    if True:
+        ppo = PPOTorch(env, args)
+        ppo.train(10000000)
+    else:
+        from stable_baselines3 import PPO
+        model = PPO('MlpPolicy', env, verbose=1, batch_size=4096, n_steps=4096)
+        model.learn(total_timesteps=1000000)
