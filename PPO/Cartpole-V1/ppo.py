@@ -15,7 +15,7 @@ class Args:
     epsilon_clip: float = 0.2
     # Batch size : Length of the buffer to store experiences
     batch_size: int = 2048
-    num_envs: int = 1
+    num_envs: int = 4
     mini_batch_size: int = 64
     epochs: int = 10
     lr_actor: float = 3e-4 # Can be tuned
@@ -245,7 +245,7 @@ class PPOTorch(nn.Module):
         assert isinstance(args, Args), "args must be an instance of the Args dataclass."
 
         if isinstance(env_or_env_id, str):
-            self.envs = gym.make_vec(env_or_env_id, args.num_envs)
+            self.envs = gym.make_vec(env_or_env_id, args.num_envs, vectorization_mode='sync')
         else:
             self.envs = env_or_env_id
         assert isinstance(self.envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
