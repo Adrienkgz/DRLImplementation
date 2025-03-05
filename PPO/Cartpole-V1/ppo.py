@@ -5,21 +5,27 @@ from dataclasses import dataclass, field
 from torch.distributions.categorical import Categorical
 import numpy as np
 import time
+from tabulate import tabulate
 
 @dataclass
 class Args:
-    
+    seed: int = None
     gamma: float = 0.99 # Have to be tuned for each environment
     lambda_gae: float = 0.9
     epsilon_clip: float = 0.2
-    num_steps: int = 2048
-    batch_size: int = 64
+    # Batch size : Length of the buffer to store experiences
+    batch_size: int = 2048
+    num_envs: int = 1
+    mini_batch_size: int = 64
     epochs: int = 10
     lr_actor: float = 3e-4 # Can be tuned
     lr_critic: float = 3e-4 # Can be tuned
     ent_coeff: float = 0.01
     norm_adv: bool = False
     max_grad_norm: float = 0.5
+    
+    def __post_init__(self):
+        self.num_steps = self.batch_size // self.num_envs
     
 @dataclass
 class MetricsContainer:
@@ -46,17 +52,19 @@ class MetricsContainer:
         self.num_updates += 1
         
     def show(self):
-        print(f'num_steps_global : {self.num_updates*self.num_steps}')
-        print(f'time_elapsed : {time.time() - self.start_time}')
-        print(f'step/seconds : {self.num_steps/(time.time() - self.last_iteration_time)}')
-        print(f'len_mean : {self.num_steps/len(self.episode_rewards)}')
-        print(f'mean_reward : {np.mean(self.episode_rewards)}')
-        print(f'mean_actor_loss : {np.mean(self.actor_losses)}')
-        print(f'mean_critic_loss : {np.mean(self.critic_losses)}')
-        print(f'mean_entropy : {np.mean(self.entropy_mean)}')
-        print(f"Variance of Advantage: {torch.var(self.advantages).item()}")
-
-        print(f'\n')
+        datas = [
+            ["Number of timesteps", f"{self.num_updates * self.num_steps:.0f}"],
+            ["Number of updates", f"{self.num_updates * 10:.0f}"],
+            #["Mean reward", f"{np.mean(self.episode_rewards):.2f}"],
+            #["Mean episode length", f"{self.num_steps / len(self.episode_rewards):.2f}"],
+            ["Time elapsed", f"{(time.time() - self.start_time):.2f} s"],
+            ["Steps per second", f"{self.num_steps / (time.time() - self.last_iteration_time):.2f}"],
+            ["Mean actor loss", f"{np.mean(self.actor_losses):.2f}"],
+            ["Mean critic loss", f"{np.mean(self.critic_losses):.2f}"],
+            ["Mean entropy", f"{np.mean(self.entropy_mean):.2f}"],
+        ]
+        
+        print(tabulate(datas, headers=["Metrics", "Value"], tablefmt="fancy_grid"))
         self.reset()
 
 @dataclass
@@ -83,7 +91,7 @@ class ExperienceBuffer:
         reset():
             Resets the buffer for the next episode.
     """
-    def __init__(self, ppo):
+    def __init__(self, ppo: object):
         """
         Initializes the PPO environment wrapper.
 
@@ -104,19 +112,28 @@ class ExperienceBuffer:
             returns (torch.Tensor): Tensor to store return estimates.
         """
         self.ppo = ppo
-        self.num_steps = ppo.args.num_steps
-        env = ppo.env
-        self.cursor = 0
-        self.states = torch.zeros(self.num_steps, env.observation_space.shape[0])
-        self.actions = torch.zeros(self.num_steps,)
-        self.rewards = torch.zeros(self.num_steps,)
-        self.next_states = torch.zeros(self.num_steps, env.observation_space.shape[0])
-        self.logprobs = torch.zeros(self.num_steps,)
-        self.dones = torch.zeros(self.num_steps,)
-        self.advantages = torch.zeros(self.num_steps,)
-        self.returns = torch.zeros(self.num_steps,)
+        self.batch_size, num_steps, num_envs = ppo.args.batch_size, ppo.args.num_steps, ppo.args.num_envs
+        self.states = torch.zeros((num_steps, num_envs) + ppo.envs.single_observation_space.shape)
+        self.actions = torch.zeros((num_steps, num_envs) + ppo.envs.single_action_space.shape)
+        self.rewards = torch.zeros((num_steps, num_envs))
+        self.next_states = torch.zeros((num_steps, num_envs) + ppo.envs.single_observation_space.shape)
+        self.rewards = torch.zeros((num_steps, num_envs))
+        self.logprobs = torch.zeros((num_steps, num_envs))
+        self.dones = torch.zeros((num_steps, num_envs))
+        self.values = torch.zeros((num_steps, num_envs))
+        
+        self.advantages = torch.zeros(self.batch_size,)
+        self.returns = torch.zeros(self.batch_size,)
     
-    def append(self, state, action, reward, next_state, logprobs, done):
+        self.cursor = 0
+    
+    def append(self, vec_states: np.array, 
+               vec_actions: np.array, 
+               vec_rewards: np.array, 
+               vec_next_states: np.array, 
+               vec_logprobs: np.array, 
+               vec_dones: np.array,
+               vec_values: np.array):
         """
         Append a new experience to the buffer.
 
@@ -131,14 +148,24 @@ class ExperienceBuffer:
         Returns:
             None
         """
-        self.states[self.cursor] = state
-        self.actions[self.cursor] = action
-        self.rewards[self.cursor] = reward
-        self.next_states[self.cursor] = next_state
-        self.logprobs[self.cursor] = logprobs
-        self.dones[self.cursor] = done
+        self.states[self.cursor] = torch.tensor(vec_states)
+        self.actions[self.cursor] = vec_actions
+        self.rewards[self.cursor] = torch.tensor(vec_rewards)
+        self.next_states[self.cursor] = torch.tensor(vec_next_states)
+        self.logprobs[self.cursor] = torch.tensor(vec_logprobs)
+        self.dones[self.cursor] = torch.tensor(vec_dones)
+        self.values[self.cursor] = vec_values.view(-1)
         self.cursor += 1
         
+    def flatten(self):
+        self.flatten_states = self.states.flatten(0, 1)
+        self.flatten_actions = self.actions.flatten()
+        self.flatten_rewards = self.rewards.flatten()
+        self.flatten_next_states = self.next_states.flatten(0, 1)
+        self.flatten_logprobs = self.logprobs.flatten()
+        self.flatten_dones = self.dones.flatten()
+        self.flatten_values = self.values.flatten()
+    
     def compute_advantages_and_returns(self):
         """
         Compute the Generalized Advantage Estimation (GAE) and returns for the current batch of experiences.
@@ -154,25 +181,25 @@ class ExperienceBuffer:
         """
         with torch.no_grad():
             # First we compute the values of the states and the next state
-            values = self.ppo.get_value(self.states)
-            next_value = self.ppo.get_value(self.next_states[-1]).reshape(1, -1)
+            values = self.flatten_values
+            next_value = self.ppo.get_value(self.flatten_next_states[-1])
 
             # We initialize the advantages and the last gae lambda
-            advantages = torch.zeros_like(self.rewards)
+            advantages = torch.zeros_like(self.flatten_rewards)
             lastgaelam = 0  
 
             # We iterate over the states in reverse order because the GAE is computed recursively
-            for t in reversed(range(self.num_steps)):
-                if t == self.num_steps - 1: # If it's the last state so the first iteration of the loop
-                    nextnonterminal = 1.0 - self.dones[-1]
+            for t in reversed(range(self.batch_size)):
+                if t == self.batch_size - 1: # If it's the last state so the first iteration of the loop
+                    nextnonterminal = 1.0 - self.flatten_dones[-1]
                     nextvalues = next_value
                 else:
-                    nextnonterminal = 1.0 - self.dones[t + 1] 
+                    nextnonterminal = 1.0 - self.flatten_dones[t + 1] 
                     nextvalues = values[t + 1]
 
                 # Compute td_error
                 # δ = r + gamma * V(s_t+1) - V(s_t)
-                delta = self.rewards[t] + self.ppo.args.gamma * nextvalues * nextnonterminal - values[t]
+                delta = self.flatten_rewards[t] + self.ppo.args.gamma * nextvalues * nextnonterminal - values[t]
                 
                 # Compute advantage
                 # A(s_t, a_t) = δ + γ * λ * A(s_t+1, a_t+1) if non-terminal then δ
@@ -189,6 +216,7 @@ class ExperienceBuffer:
             
     def reset(self):
         self.cursor = 0
+        
         
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     """
@@ -210,12 +238,19 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class PPOTorch(nn.Module):
-    def __init__(self, env, args):
+    def __init__(self, env_or_env_id: str | gym.Env, args: Args):
         super(PPOTorch, self).__init__()
         
-        # Initialization of env
-        self.env = env
-        
+        assert isinstance(env_or_env_id, (str, gym.Env)), "env_or_env_id must be a string or a gym.Env instance."
+        assert isinstance(args, Args), "args must be an instance of the Args dataclass."
+
+        if isinstance(env_or_env_id, str):
+            self.envs = gym.make_vec(env_or_env_id, args.num_envs)
+        else:
+            self.envs = env_or_env_id
+        assert isinstance(self.envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+
+            
         # Initialization of ppo variable
         self.args = args
         self.actual_step = 1
@@ -223,13 +258,21 @@ class PPOTorch(nn.Module):
         # Initialization of actor and critic networks and their optimizers
         self.actor = self.create_network('actor')
         self.critic = self.create_network('critic')
-        self.optimizer_actor = torch.optim.Adam(self.actor.parameters(), lr=args.lr_actor, betas=(0.9, 0.999))
+        self.optimizer_actor = torch.optim.Adam(self.actor.parameters(), lr=args.lr_actor)
         self.optimizer_critic = torch.optim.Adam(self.critic.parameters(), lr=args.lr_critic)
         
         # Variable used in the algorithm
         self.buffer = ExperienceBuffer(self)
         # Variable used in metrics
         self.metrics = MetricsContainer(args.num_steps)
+        
+        # Initialization seeds ( in case we want to reproduce the results )
+        if args.seed is not None:
+            import random
+            random.seed(args.seed)
+            np.random.seed(args.seed)
+            torch.manual_seed(args.seed)
+            torch.backends.cudnn.deterministic = True
         
     def create_network(self, net_type):
         """
@@ -239,9 +282,11 @@ class PPOTorch(nn.Module):
         Returns:
             nn.Sequential: A sequential container of the network layers.
         """
+        assert net_type in ['actor', 'critic'], "net_type must be either 'actor' or 'critic'."
+        
         # We use the standard architecture for the networks
         layers = [
-            layer_init(nn.Linear(self.env.observation_space.shape[0], 64)),
+            layer_init(nn.Linear(self.envs.single_observation_space.shape[0], 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
@@ -249,12 +294,12 @@ class PPOTorch(nn.Module):
         
         # We add the last layer depending on the network type
         if net_type == 'actor':
-            layers.append(layer_init(nn.Linear(64, self.env.action_space.n), std=0.01))
+            layers.append(layer_init(nn.Linear(64, self.envs.single_action_space.n), std=0.01))
         else:
             layers.append(layer_init(nn.Linear(64, 1), std=1))
         return nn.Sequential(*layers)
         
-    def get_action_and_value(self, x, action=None):
+    def get_action_and_value(self, x: torch.tensor, action: int=None):
         """
         Compute the action to take and its associated value.
 
@@ -269,6 +314,8 @@ class PPOTorch(nn.Module):
             - entropy (torch.Tensor): The entropy of the action distribution.
             - value (torch.Tensor): The value of the state as estimated by the critic.
         """
+        assert isinstance(x, torch.Tensor), "x must be a torch.Tensor instance."
+        
         # Compute the logits for the actor network
         logits = self.actor(x)
         
@@ -282,7 +329,7 @@ class PPOTorch(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
     
-    def get_value(self, x):
+    def get_value(self, x: torch.tensor):
         """
         Computes the value of the given input state using the critic network.
 
@@ -292,9 +339,11 @@ class PPOTorch(nn.Module):
         Returns:
             torch.Tensor: The value of the input state as predicted by the critic network.
         """
+        assert isinstance(x, torch.Tensor), "x must be a torch.Tensor instance."
+        
         return self.critic(x)
     
-    def train(self, total_timesteps):
+    def train(self, total_timesteps: int):
         """
         Train the PPO agent for a specified number of timesteps.
         Args:
@@ -305,33 +354,26 @@ class PPOTorch(nn.Module):
         and the agent is updated periodically based on the specified number of steps. 
         Metrics such as episode rewards and entropy mean are recorded for analysis.
         """
-        while self.actual_step < total_timesteps:
-            state, _ = self.env.reset(seed=12)
-            state = torch.tensor(state, dtype=torch.float32)
-            episode_reward = 0
-            done = False
-            entropies = []
-            while not done:
+        assert isinstance(total_timesteps, int), "total_timesteps must be an integer."
+        
+        number_updates = total_timesteps // self.args.num_steps
+        for _ in range(number_updates):
+            vec_states, _ = self.envs.reset(seed=self.args.seed)
+            vec_dones = np.zeros(self.args.num_envs)
+            
+            for _ in range(self.args.num_steps):
                 with torch.no_grad():
-                    action, logprobs, entropy, _ = self.get_action_and_value(state)
-                entropies.append(entropy)
-                next_state, reward, terminated, truncated, _ = self.env.step(action.item())
-                done = terminated or truncated
-                next_state, reward = torch.tensor(next_state, dtype=torch.float32), torch.tensor(reward, dtype=torch.float32)
-                episode_reward += reward.item()
+                    vec_actions, vec_logprobs, vec_entropy, vec_values = self.get_action_and_value(torch.tensor(vec_states))
+                vec_next_states, vec_rewards, vec_terminated, vec_truncated, _ = self.envs.step(vec_actions.numpy())
                 
-                # I have decided to use a class Experience to make the code easier to understand
-                self.buffer.append(state, action, reward, next_state, logprobs, done)
-                if self.actual_step % self.args.num_steps == 0 and self.actual_step != 0:
-                    self.update()
-                    self.metrics.show()
-
-                state = next_state
-                self.actual_step += 1
-            self.metrics.episode_rewards.append(episode_reward)
-            self.metrics.entropy_mean.append(torch.stack(entropies).mean().item())
+                vec_dones = np.logical_or(vec_terminated, vec_truncated)
                 
-    def update(self):
+                self.buffer.append(vec_states, vec_actions, vec_rewards, vec_next_states, vec_logprobs, vec_dones, vec_values)
+                
+            self.learn()
+            self.metrics.show()
+                
+    def learn(self):
         """
         Updates the actor and critic networks using the data stored in the buffer.
 
@@ -342,6 +384,7 @@ class PPOTorch(nn.Module):
             b. Updates the critic.
         3. Resets the buffer after the updates are completed.
         """
+        self.buffer.flatten()
         self.buffer.compute_advantages_and_returns()
         for _ in range(self.args.epochs):
             self.update_actor_policy()
@@ -366,7 +409,7 @@ class PPOTorch(nn.Module):
         Returns:
             None
         """
-        def compute_clip_loss(batch_old_policies, batch_new_policies, batch_advantages):
+        def compute_clip_loss(batch_old_policies: torch.tensor, batch_new_policies: torch.tensor, batch_advantages: torch.tensor):
             """
             Computes the clipped loss for Proximal Policy Optimization (PPO).
 
@@ -383,14 +426,7 @@ class PPOTorch(nn.Module):
                 batch_advantages = batch_advantages / (torch.abs(batch_advantages).mean() + 1e-8)
                 
             # We want to calculate π(a|s) / π_old(a|s)
-            # We already have log π(a|s) and log π_old(a|s)
-            # So we need to calculate π(a|s) / π_old(a|s)
-            # We know that :
-            # log(π(a|s) / π_old(a|s)) = log(π(a|s)) - log(π_old(a|s))
-            # So we have
-            # log_ratios = log(π(a|s) / π_old(a|s)) = log(π(a|s)) - log(π_old(a|s))
-            # Then we can calculate the ratios by taking the exponential
-            # ratios = exp(log_ratios)
+            # We have log[π(a|s)] and log[π_old(a|s)]
             logratios = batch_new_policies - batch_old_policies
             ratios = torch.exp(logratios)
             
@@ -403,15 +439,15 @@ class PPOTorch(nn.Module):
             return loss.mean()
         
         # We retrieve the old policies, states, advantages, and actions from the buffer
-        old_policies = self.buffer.logprobs
-        states = self.buffer.states
+        old_policies = self.buffer.flatten_logprobs
+        states = self.buffer.flatten_states
         advantages = self.buffer.advantages
-        actions = self.buffer.actions
+        actions = self.buffer.flatten_actions
         
         # We want to shuffle the experiences
-        global_indices = torch.randperm(self.args.num_steps)
-        for start in range(0, self.args.num_steps, self.args.batch_size):
-            end = start + self.args.batch_size
+        global_indices = torch.randperm(self.args.batch_size)
+        for start in range(0, self.args.batch_size, self.args.mini_batch_size):
+            end = start + self.args.mini_batch_size
             local_indices = global_indices[start:end]
             batch_states = states[local_indices]
             batch_actions = actions[local_indices]
@@ -454,7 +490,7 @@ class PPOTorch(nn.Module):
         Returns:
             None
         """
-        def compute_loss_critic(states, returns):
+        def compute_loss_critic(batch_states, returns: torch.tensor):
             """
             Computes the loss for the critic network.
 
@@ -469,16 +505,16 @@ class PPOTorch(nn.Module):
             Returns:
                 torch.Tensor: The computed loss value.
             """
-            return 0.5 * ((self.critic(states) - returns) ** 2).mean()
+            return 0.5 * ((self.critic(batch_states) - returns) ** 2).mean()
         
         # We retrieve the states and returns from the buffer
-        states = self.buffer.states
+        states = self.buffer.flatten_states
         returns = self.buffer.returns
         
         # We shuffle the experiences as we done on the actor
-        global_indices = torch.randperm(self.args.num_steps)
-        for start in range(0, self.args.num_steps, self.args.batch_size):
-            end = start + self.args.batch_size
+        global_indices = torch.randperm(self.args.batch_size)
+        for start in range(0, self.args.num_steps, self.args.mini_batch_size):
+            end = start + self.args.mini_batch_size
             local_indices = global_indices[start:end]
             batch_states = states[local_indices]
             batch_targets = returns[local_indices]
@@ -497,11 +533,5 @@ class PPOTorch(nn.Module):
     
 if __name__ == '__main__':
     args = Args()
-    env = gym.make('CartPole-v1')
-    if False:
-        ppo = PPOTorch(env, args)
-        ppo.train(10000000)
-    else:
-        from stable_baselines3 import PPO
-        model = PPO('MlpPolicy', env, verbose=1, batch_size=64, n_steps=2048)
-        model.learn(total_timesteps=1000000)
+    ppo = PPOTorch(env_or_env_id='CartPole-v1', args=args)
+    ppo.train(10000000)
